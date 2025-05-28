@@ -1,0 +1,284 @@
+##########################################################################
+# CODE FOR RUNNING AN SDM IN R                                           #
+##########################################################################
+#Install pacman once (if not already installed); pacman allows easy load/install of packages 
+if(!"pacman" %in% installed.packages()) install.packages("pacman")
+
+#Load (and install) packages
+pacman::p_load(tidyverse, terra, sf, covsel, SDMtune, blockCV)
+
+###########################################################################################################
+#Environmental data
+###########################################################################################################
+
+#Slope
+#---------------------
+#We will calculate slope from a digital elevation model (DEM), specifically NASADEM
+rst_dem = rast('Data/NASADEM.tif')
+rst_dem
+#Calculate slope raster
+?terrain
+env_slope = terrain(rst_dem, v="slope", unit="degrees", 
+                    filename = 'Output/Predictors/env_slope.tif',
+                    overwrite = T, names = 'slope')
+#We will need to get slope to same resolution as climate layers, so
+#read in one climate layer for now
+clim_rasts = rast('Data/CHELSA_bioclim_10min/CHELSA_bio10_01_10min.tif')
+clim_rasts = crop(clim_rasts, env_slope)
+#Check resolutions
+res(env_slope)
+res(clim_rasts)
+#Aggregate slope layer
+res(clim_rasts) / res(env_slope)
+env_slope = terra::aggregate(env_slope, fact = 600)
+res(env_slope)
+#Check projection
+same.crs(env_slope, clim_rasts)
+env_slope_reproj = project(env_slope, crs(clim_rasts))
+
+# #Check extent
+# soil_cape_rasts = resample(soil_cape_rasts, clim_rasts)
+# #Aggregate to same resolution as climate data
+# res(clim_rasts) / res(env_slope)
+# env_slope_agg = aggregate(env_slope, fact = 30, fun = 'mean', na.rm = T)
+# env_slope_agg = resample(env_slope_agg, clim_rasts)
+# #Give same projection as climate layers
+# crs(env_slope_agg) = crs(clim_rasts)
+
+
+#Cramer soil variables
+#---------------------
+#https://onlinelibrary.wiley.com/doi/full/10.1111/ddi.12973
+#https://datadryad.org/stash/dataset/doi:10.5061/dryad.37qc017
+soil_cape_files = list.files('Data/Cramer_CFR_soils/') %>%
+  str_subset('.tif')
+soil_cape_files
+soil_cape_rasts = rast(
+  paste0('Data/Cramer_CFR_soils/',soil_cape_files)
+  )
+#Check resolution of slope and climate layers
+res(soil_cape_rasts)
+res(clim_rasts)
+#Aggregate
+res(clim_rasts) / res(soil_cape_rasts)
+soil_cape_rasts = terra::aggregate(soil_cape_rasts, fact = 20)
+res(soil_cape_rasts)
+#Check extents
+ext(soil_cape_rasts)
+ext(env_slope_reproj)
+#Crop soil layers to extent of slope layer
+soil_cape_rasts = crop(soil_cape_rasts, env_slope_reproj)
+#Resample soil layer to same resolution as slope layer
+res(env_slope_reproj)
+res(soil_cape_rasts)
+soil_cape_rasts = resample(soil_cape_rasts, env_slope_reproj)
+#Rename some variables
+names(soil_cape_rasts)
+names(soil_cape_rasts)[names(soil_cape_rasts) %in% c("Total_C_%","Total_N_%")] =
+  c("Total_C_perc","Total_N_perc")
+
+
+#Climate
+#---------------------
+#Climate data from CHELSA
+#BIO5 = Max Temperature of Warmest Month ~ average summer maximum temperatures
+#BIO6 = Min Temperature of Coldest Month ~ average winter minimum temperatures
+#BIO18 = Precipitation of Warmest  Quarter ~ total summer rainfall
+#BIO19 = Precipitation of Coldest Quarter ~ total winter rainfall
+clim_files = list.files('Data/CHELSA_bioclim_10min/')
+clim_files = paste0("CHELSA_bio10_",c("05","06",18,19),"_10min.tif")
+clim_rasts = rast(
+  paste0('Data/CHELSA_bioclim_10min/',clim_files)
+)
+clim_rasts = crop(clim_rasts, soil_cape_rasts)
+plot(clim_rasts)
+
+#Stack all raster layers together
+#--------------------------------
+pred_stack = rast(list(env_slope_reproj, soil_cape_rasts, clim_rasts))
+pred_stack
+names(pred_stack)
+writeRaster(pred_stack, filename = 'Output/pred_stack.tif', overwrite = T)
+
+#Read in predictor raster stack
+pred_stack = rast('Output/pred_stack.tif')
+
+
+#---------------------------------------------------------------
+#Create an NA raster with common NA cells across all rasters in pred_stack
+#---------------------------------------------------------------
+rastNA = pred_stack
+rastNA[!is.na(rastNA)] = 0 #Change all non-NA pixels to 0
+rastNA = terra::app(rastNA, mean, na.rm = F) #Calculate the "mean" of each pixel across all rasters (will be 0 for non-NA pixels and NA for any pixel that is NA for any of the rasters)
+plot(rastNA)
+#Now change non-NA values to "ID values" for identifying duplicate occurrences among raster pixels
+rastNA[!is.na(rastNA)] = 1:ncell(rastNA[!is.na(rastNA)]) #Assign each pixel a unique number ID
+plot(rastNA)
+writeRaster(rastNA, "Output/rastNA.tif", overwrite = T)
+
+#Mask raster stack by rastNA
+pred_stack = mask(pred_stack, rastNA)
+
+#Write stack
+writeRaster(pred_stack, filename = "Output/pred_stack.tif", overwrite = T)
+
+
+
+###########################################################################################################
+#Occurrence data
+###########################################################################################################
+
+#Read in occurrence data
+occ = read.csv("Data/Occurrences/Aspalathus_linearis.csv", sep='\t')
+names(occ)
+#Rename lat and lon
+?rename
+occ = occ %>%
+  rename(x = decimalLongitude,
+         y = decimalLatitude)
+
+#Get non-duplicated occurrences
+occ$id = terra::extract(rastNA, cbind(occ$x, occ$y))$mean
+occ = occ[!duplicated(occ$id) & !is.na(occ$id),]
+
+
+###########################################################################################################
+#Some initialisation stuff
+###########################################################################################################
+
+#Create output directory for Maxent models
+if(!file.exists('Output/Maxent/')){ 
+  dir.create('Output/Maxent/', showWarnings = FALSE, recursive = T) }
+
+
+###########################################################################################################
+# Select uncorrelated predictor variables using background data
+###########################################################################################################
+
+#Get background points
+#------------------------------------------------------------------
+#Mask out pixels for which species of interest occurs in
+study_area_rast = rastNA
+#Get the cell index for each occurrence record of the species of interest and make a table
+count_pres_rast = table(cellFromXY(study_area_rast, cbind(occ$x, occ$y)))
+#Make cells NA in which presences occur in weighted grid raster
+study_area_rast[as.numeric(names(count_pres_rast))] = NA
+plot(study_area_rast)
+#Count number of available background points
+ncell(study_area_rast[!is.na(study_area_rast)])
+#Get sample of background points
+set.seed(1)
+# study_area_rast = study_area_rast + 1 #So that function below samples pixels with 0 value
+backs_xy = spatSample(study_area_rast, size = 100, na.rm = T,
+                      replace = F, xy = T)
+backs_xy = backs_xy %>% dplyr::select(x, y) #Select only coordinates
+
+#Test for collinearity among environmental layers
+#---------------------------------------------------------------
+#Join presence and background data together
+pa = rbind(data.frame(pres_abs = 1, x = occ$x, y = occ$y), 
+               data.frame(pres_abs = 0, x = backs_xy$x, y = backs_xy$y))
+
+#Add predictor data to PA data
+pa_pred = cbind(pa, terra::extract(pred_stack, cbind(pa$x, pa$y)))
+pa_pred = na.omit(pa_pred) #Remove any with NA values for predictor variables
+
+#Covariate collinearity check.
+#https://github.com/N-SDM/covsel
+cov_data = pa_pred %>% dplyr::select(-c(pres_abs, x, y)) #Select only environmental data
+covdata_filter = covsel.filteralgo(covdata = cov_data,
+                                   pa = pa_pred$pres_abs, #Select presence-background column
+                                   corcut = 0.7) #Dormann et al. (2013) Collinearity
+#Uncorrelated variables
+(uncorrvars = names(covdata_filter))
+names(pred_stack)
+
+#Create stack of only uncorrelated variables for full extent
+pred_stack_uncorr = pred_stack[[uncorrvars]]
+names(pred_stack_uncorr)
+
+#####################################################################################
+#Setting up for Maxent
+#####################################################################################
+
+#Create directory to store Maxent output
+output_dir = paste0('Output/Maxent/A_linearis/')
+if(!file.exists(output_dir)){ 
+  dir.create(output_dir, showWarnings = FALSE, recursive = T) }
+
+
+#Create sf object from pa
+pa_sf = st_as_sf(x = pa,
+                 coords = c("x", "y"),
+                 crs = crs(pred_stack))
+
+
+#Get folds for environmentally separated k-fold cross-validation
+#------------------------------------------------------------------------
+block_size = 20000 #Set block size to 20 km
+#Get spatial blocks and divide data into CV folds
+sb = cv_spatial(x = pa_sf,
+                column = "pres_abs",
+                r = pred_stack_uncorr[[1]],
+                k = 3, #number of folds
+                size = block_size, #size of the blocks
+                selection = "systematic",
+                iteration = 50, 
+                biomod2 = F,
+                plot = T,
+                seed = 1)
+pa$fold_IDs = sb$folds_ids #Assign fold IDs to pa data.frame
+#Check number of presences in each fold
+(num_pa_folds = pa %>%
+  group_by(pres_abs, fold_IDs) %>%
+  dplyr::filter(pres_abs==1) %>%
+  dplyr::summarise(n = n()))
+  
+#Get folds data into correct format for SDMtune
+folds_dat = list(
+  occs.grp = pa %>% dplyr::filter(pres_abs==1) %>% dplyr::pull(fold_IDs),
+  bg.grp = pa %>% dplyr::filter(pres_abs==0) %>% dplyr::pull(fold_IDs)
+)
+  
+#####################################################################################
+#Maxent modelling
+#####################################################################################
+#Create SWD object for SDMtune maxnet
+swd = prepareSWD(species = 'A.linearis', 
+                 env = pred_stack_uncorr,
+                 p = pa %>% filter(pres_abs==1) %>% dplyr::select(c(x, y)), 
+                 a = pa %>% filter(pres_abs==0) %>% dplyr::select(c(x, y)))
+
+#Maxent model
+mx = train(method = "Maxnet",
+            data = swd,
+            fc = "lqp",
+            reg = 0.8,
+            folds = folds_dat)
+
+#Get variable importances
+vi_maxnet = varImp(mx, permut = 5)
+vi_maxnet
+
+# Plot a response curve
+names(pred_stack_uncorr)
+plotResponse(mx, var = 'CHELSA_bio10_19_10min', type = "cloglog")
+
+#Check model accuracy
+auc(mx)
+
+#Get projected distribution
+proj_dist = predict(pred_stack_uncorr, mx, clamp=F, type="cloglog",
+                    na.rm=TRUE,
+                    filename = 'Output/Maxent/A_linearis/Predicted_distribution.tif', 
+                    overwrite=T)
+plot(proj_dist)
+plotPred(proj_dist) #SDMtune version
+  
+
+
+
+
+
+
+
