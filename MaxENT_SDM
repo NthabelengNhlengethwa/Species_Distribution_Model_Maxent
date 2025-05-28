@@ -1,0 +1,309 @@
+##########################################################################
+# CODE FOR RUNNING AN SDM IN R                                           #
+##########################################################################
+#Install pacman once (if not already installed); pacman allows easy load/install of packages 
+if(!"pacman" %in% installed.packages()) install.packages("pacman")
+
+#Load (and install) packages
+if(!"covsel" %in% installed.packages()) 
+  devtools::install_github("N-SDM/covsel",
+                           dependencies = T,
+                           upgrade="always")
+pacman::p_load(tidyverse, terra, sf, covsel, SDMtune, blockCV, cowplot)
+
+###########################################################################################################
+# Environmental data ######
+###########################################################################################################
+
+#Climate
+#---------------------
+#Climate data from CHELSA
+clim_files = list.files('CHELSA_bioclim_2.5min')
+clim_rasts = rast(
+  paste0('CHELSA_bioclim_2.5min/',clim_files)
+)
+shp_sa = st_read('Data/Provinces/provincial.shp') #Get map of SA
+shp_sa = st_set_crs(shp_sa, st_crs(clim_rasts)) #Assign CRS
+clim_rasts = crop(clim_rasts, shp_sa)
+clim_rasts = mask(clim_rasts, shp_sa)
+plot(clim_rasts)
+
+pred_stack = clim_rasts #To make the code below more similar to our previous
+#SDM code, create a pred_stack object
+
+
+##########################################################################################################
+# Occurrence data ######
+###########################################################################################################
+
+#Read in occurrence data
+occ = read.csv("test1.csv", sep='\t')
+names(occ)
+#Rename lat and lon
+occ = occ %>%
+  rename(x = decimalLongitude,
+         y = decimalLatitude)
+
+#Create an NA raster with common NA cells across all rasters in pred_stack
+rastNA = pred_stack
+rastNA[!is.na(rastNA)] = 0 #Change all non-NA pixels to 0
+rastNA = terra::app(rastNA, mean, na.rm = F) #Calculate the "mean" of each pixel across all rasters (will be 0 for non-NA pixels and NA for any pixel that is NA for any of the rasters)
+
+#Get non-duplicated occurrences
+(occ_rastNA = terra::extract(rastNA, cbind(occ$x, occ$y), cells = T))
+occ = occ[!duplicated(occ_rastNA$cell) & !is.na(occ_rastNA$mean),]
+
+
+###########################################################################################################
+# Get background points ######
+###########################################################################################################
+# Mask out pixels for which species of interest occurs in
+#--------------------------------------------------------
+study_area_rast = rastNA #Create new raster
+study_area_rast[!is.na(study_area_rast)] = 0 #Assign all non-NA cells a value of 0
+occ_cells = extract(study_area_rast, cbind(occ$x, occ$y), cells = T)$cell #Get cell IDs of occurrences
+study_area_rast[occ_cells] = NA #Make cells NA in which presences occur
+plot(study_area_rast)
+
+# Get background points
+#--------------------------------------------------------
+#Count number of available background points
+ncell(study_area_rast[!is.na(study_area_rast)])
+#Get sample of background points
+set.seed(1)
+backs_xy = spatSample(study_area_rast, size = 10000, na.rm = T,
+                      replace = F, xy = T) 
+backs_xy = backs_xy %>% dplyr::select(x, y) #Select only coordinates
+
+
+#####################################################################################
+# Test for collinearity among environmental layers ####
+#####################################################################################
+
+# Join presence and background data together
+#--------------------------------------------------------
+pa = rbind(data.frame(pres_abs = 1, x = occ$x, y = occ$y), 
+           data.frame(pres_abs = 0, x = backs_xy$x, y = backs_xy$y))
+
+#Add predictor data to PA data
+pa_pred = cbind(pa, terra::extract(pred_stack, cbind(pa$x, pa$y)))
+
+#Covariate collinearity check.
+cov_data = pa_pred %>% dplyr::select(-c(pres_abs, x, y)) #Select only environmental data
+covdata_filter = covsel.filteralgo(covdata = cov_data,
+                                   pa = pa_pred$pres_abs, #Select presence-background column
+                                   corcut = 0.7) #Dormann et al. (2013) Collinearity
+(uncorrvars = names(covdata_filter)) #Uncorrelated variables
+
+#Create stack of only uncorrelated variables
+pred_stack_uncorr = pred_stack[[uncorrvars]]
+
+
+#####################################################################################
+# Get SWD object needed for SDMtune #####
+#####################################################################################
+swd = prepareSWD(species = "Paniculum maximum",
+                   p = occ %>% select(x,y),
+                   a = backs_xy,
+                   env = pred_stack_uncorr)
+
+
+#####################################################################################
+# Get folds for environmentally separated k-fold cross-validation (blockCV) ######
+#####################################################################################
+
+#Create sf object from pa
+pa_sf = st_as_sf(x = pa,
+                 coords = c("x", "y"),
+                 crs = crs(pred_stack_uncorr))
+
+# Choose block size to minimise spatial autocorrelation
+rng_pp = cv_spatial_autocor(r = pred_stack_uncorr, 
+                            x = pa_sf, 
+                            column = 'pres_abs',
+                            plot = T)
+block_size = rng_pp$range_table$range
+# block_size = 100000 #Set block size to 100 km
+
+# Get spatial blocks and divide data into CV folds
+sb = cv_spatial(x = pa_sf,
+                column = "pres_abs",
+                r = pred_stack_uncorr[[1]],
+                k = 3, #number of folds
+                size = block_size, #size of the blocks
+                selection = "systematic",
+                iteration = 50, 
+                biomod2 = F,
+                plot = T,
+                seed = 1)
+pa$fold_IDs = sb$folds_ids #Assign fold IDs to pa data.frame
+#Check number of presences in each fold
+(num_pa_folds = pa %>%
+  group_by(pres_abs, fold_IDs) %>%
+  dplyr::filter(pres_abs==1) %>%
+  dplyr::summarise(n = n()))
+  
+#Get folds data into correct format for SDMtune
+folds_dat = list(
+  occs.grp = pa %>% dplyr::filter(pres_abs==1) %>% dplyr::pull(fold_IDs),
+  bg.grp = pa %>% dplyr::filter(pres_abs==0) %>% dplyr::pull(fold_IDs)
+)
+  
+#####################################################################################
+# Tune Maxnet hyperparameters ######
+#####################################################################################
+
+# Maxnet model doing cross validation
+mx_cv = train(method = "Maxnet",
+            data = swd,
+            folds = folds_dat)
+
+# Create list of possible hyperparameter values
+hyp_list = list(reg = seq(0.2, 5, 0.2), 
+                fc = c("l", "lq", "lh", "lp", "lqp", "lqph"))
+
+# Run models using random combination of hyperparameter values
+mx_search = randomSearch(mx_cv, 
+                         hypers = hyp_list,
+                         metric = "auc",
+                         pop = 10, #Number of models to run
+                         seed = 1)
+
+
+#####################################################################################
+# Get best model and analyse #####
+#####################################################################################
+
+# Get best model by combining cross-validation models by retraining a new model 
+# with all presence and background data and the same hyperparameters
+mx_best_cv = mx_search@models[[1]] # Get cv models with best hyperparameters
+mx_best = combineCV(mx_best_cv)
+
+# Get model auc
+auc(mx_best_cv)
+# This is the mean auc of all the cross-validation models. Ideally you would want
+# to report on its variability too. I have "hijacked" the package's code for this
+# and modified it in the script called in below. You can check out the modifications
+# in that script.
+source('Code/auc_modified.R')
+auc_modified(mx_best_cv)
+mean(auc_modified(mx_best_cv))
+sd(auc_modified(mx_best_cv))
+
+
+#####################################################################################
+# Response curves #####
+#####################################################################################
+
+#Get variable importances
+vi_maxnet = varImp(mx_best, permut = 5)
+vi_maxnet
+
+# Plot a response curve
+gg_CHELSA_bio10_06_2halfmin = plotResponse(mx_best_cv, 
+                                           var = 'CHELSA_bio10_06_2halfmin', 
+                                           type = "cloglog",
+                                           marginal = T) 
+gg_CHELSA_bio10_18_2halfmin = plotResponse(mx_best_cv, 
+                                           var = 'CHELSA_bio10_18_2halfmin', 
+                                           type = "cloglog",
+                                           marginal = T) 
+gg_CHELSA_bio10_05_2halfmin  = plotResponse(mx_best_cv, 
+                                           var = 'CHELSA_bio10_05_2halfmin', 
+                                           type = "cloglog",
+                                           marginal = T) 
+gg_CHELSA_bio10_08_2halfmin  = plotResponse(mx_best_cv, 
+                                            var = 'CHELSA_bio10_08_2halfmin', 
+                                            type = "cloglog",
+                                            marginal = T) 
+gg_CHELSA_bio10_15_2halfmin  = plotResponse(mx_best_cv, 
+                                            var = 'CHELSA_bio10_15_2halfmin', 
+                                            type = "cloglog",
+                                            marginal = T) 
+gg_CHELSA_bio10_03_2halfmin  = plotResponse(mx_best_cv, 
+                                            var = 'CHELSA_bio10_03_2halfmin', 
+                                            type = "cloglog",
+                                            marginal = T) 
+gg_CHELSA_bio10_06_2halfmin
+gg_CHELSA_bio10_18_2halfmin
+gg_CHELSA_bio10_05_2halfmin
+gg_CHELSA_bio10_08_2halfmin
+gg_CHELSA_bio10_15_2halfmin
+gg_CHELSA_bio10_07_2halfmin
+gg_CHELSA_bio10_03_2halfmin
+#Marginal response curves
+# show the relationship of a variable while holding all other variables at their
+# mean value
+
+# Plot all response curves
+pmap(.l = list(vi_maxnet$Variable), #Variable names
+     .f = function(x) 
+       assign( #We use the assign function to create a ggplot object for each variable
+         paste0('gg_',as.character(x)), #ggplot name
+         plotResponse(mx_best_cv, var = x, type = "cloglog", marginal = T) + 
+           lims(y = c(0,1))
+           , #Create ggplot object using plotResponse function
+         envir = .GlobalEnv #Need this so it outputs to Global Environment
+         )
+     )
+
+# Combine all response curves into one plot
+gg_resp_curves = plot_grid(gg_CHELSA_bio10_06_2halfmin,
+                           gg_CHELSA_bio10_18_2halfmin,
+                           gg_CHELSA_bio10_05_2halfmin,
+                           gg_CHELSA_bio10_08_2halfmin,
+                           gg_CHELSA_bio10_15_2halfmin,
+                           gg_CHELSA_bio10_07_2halfmin,
+                           gg_CHELSA_bio10_03_2halfmin,
+                           ncol = 2, align = 'h', axis = 'bt')
+gg_resp_curves
+ggsave(gg_resp_curves, filename = "Response_test.png", 
+       device = "png", height = 21, width = 16, units = 'cm')
+
+
+#####################################################################################
+# Get projected distribution
+#####################################################################################
+proj_dist = predict(pred_stack_uncorr, mx_best, clamp=F, type="cloglog",
+                    na.rm=TRUE,
+                    filename = 'test_predicted_distribution.tif', 
+                    overwrite=T)
+plot(proj_dist)
+plotPred(proj_dist) #SDMtune version
+
+# Customised ggplot version
+proj_dist_df = as.data.frame(proj_dist, xy = T) #Convert raster to df
+names(proj_dist_df)
+gg_pred_dist = ggplot() +
+  geom_raster(data = proj_dist_df, aes(x = x, y = y, fill = lyr1)) +
+  scale_fill_gradientn(colours = 
+                         c('#2c7bb6','#2c7bb6','#abd9e9','#fdae61','#d7191c'), 
+                       na.value = "transparent",
+                       name='Suitability', limits=c(0,1), 
+                       breaks=c(0.25,0.5,0.75)) +
+  guides(fill = guide_colourbar(title.hjust = 0.5, title.position='top')) +
+  coord_sf() +
+  labs(title = 'Panicum Maximum') +
+  theme_bw() +
+  theme(text = element_text(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_blank(),
+        strip.text = element_text(size = 12, colour = "black"),
+        axis.ticks.y = element_line(linewidth = 0.2),
+        axis.text.x.top = element_blank(),
+        axis.text.x = element_text(size = 8, vjust = 0.5),
+        axis.text.y = element_text(size = 8, angle = 0, hjust = 0.5)) +
+  labs(x = NULL, y = NULL)
+gg_pred_dist
+  
+# If you wanted to project to, for example, future climates, you would do exactly
+# as above except you would substitute pred_stack_uncorr with a new raster stack
+# of variables representing future climate values but that still have the same
+# variable names as the raster stack in pred_stack_uncorr
+
+
+
+
+
+
