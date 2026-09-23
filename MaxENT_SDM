@@ -22,21 +22,22 @@ clim_files = list.files('CHELSA_bioclim_2.5min')
 clim_rasts = rast(
   paste0('CHELSA_bioclim_2.5min/',clim_files)
 )
-shp_sa = st_read('Data/Provinces/provincial.shp') #Get map of SA
+shp_sa = st_read('Data/Provinces/provincial.shp') #path to shp file
 shp_sa = st_set_crs(shp_sa, st_crs(clim_rasts)) #Assign CRS
 clim_rasts = crop(clim_rasts, shp_sa)
 clim_rasts = mask(clim_rasts, shp_sa)
 plot(clim_rasts)
 
-pred_stack = clim_rasts #To make the code below more similar to our previous
-#SDM code, create a pred_stack object
+#create a pred_stack object
+pred_stack = clim_rasts 
+
 
 
 ##########################################################################################################
 # Occurrence data ######
 ###########################################################################################################
 
-#Read in occurrence data
+#Read in occurrence data from GBIF
 occ = read.csv("test1.csv", sep='\t')
 names(occ)
 #Rename lat and lon
